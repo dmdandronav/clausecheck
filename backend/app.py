@@ -176,5 +176,26 @@ def chat():
     return jsonify({"reply": reply, "sources": sources})
 
 
+@app.route("/api/analyze-document", methods=["POST"])
+def analyze_document():
+    data = request.get_json()
+    text = data.get("text", "").strip()
+    if not text:
+        return jsonify({"error": "No document text provided"}), 400
+
+    try:
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": f"Please analyze this document:\n\n{text[:8000]}"}
+            ],
+            temperature=0.3,
+        )
+        return jsonify({"analysis": response.choices[0].message.content})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 if __name__ == "__main__":
     app.run(debug=True, port=5000)
