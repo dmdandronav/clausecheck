@@ -35,10 +35,20 @@ CORS(app)  # allow the Vite dev server (localhost:5173) to call this API
 # ---------------------------------------------------------------------------
 # Client setup — works with OpenAI, Groq, or any OpenAI-compatible API
 # ---------------------------------------------------------------------------
-client = OpenAI(
-    api_key=os.environ.get("OPENAI_API_KEY"),
-    base_url=os.environ.get("OPENAI_BASE_URL") or None,  # e.g. https://api.groq.com/openai/v1
-)
+# Lazily construct the OpenAI client so the server always boots, even if the
+# API key is a placeholder or the client can't be built yet. Any construction
+# error surfaces as a clean JSON error at request time instead of crashing boot.
+_client = None
+
+
+def get_client():
+    global _client
+    if _client is None:
+        _client = OpenAI(
+            api_key=os.environ.get("OPENAI_API_KEY"),
+            base_url=os.environ.get("OPENAI_BASE_URL") or None,  # e.g. https://api.groq.com/openai/v1
+        )
+    return _client
 MODEL = os.environ.get("MODEL_NAME", "gpt-4o-mini")
 EMBED_MODEL = os.environ.get("EMBED_MODEL_NAME", "text-embedding-3-small")
 
@@ -91,7 +101,7 @@ def build_index():
         INDEX_PATH.write_text(json.dumps([]))
         return []
 
-    resp = client.embeddings.create(model=EMBED_MODEL, input=[r["text"] for r in records])
+    resp = get_client().embeddings.create(model=EMBED_MODEL, input=[r["text"] for r in records])
     for r, e in zip(records, resp.data):
         r["embedding"] = e.embedding
 
@@ -110,7 +120,7 @@ def retrieve(query: str, top_k: int = 3):
     records = load_index()
     if not records:
         return []
-    q_emb = client.embeddings.create(model=EMBED_MODEL, input=[query]).data[0].embedding
+    q_emb = get_client().embeddings.create(model=EMBED_MODEL, input=[query]).data[0].embedding
     scored = sorted(records, key=lambda r: cosine(q_emb, r["embedding"]), reverse=True)
     return scored[:top_k]
 
@@ -136,7 +146,10 @@ def add_document():
     save_path = DATA_DIR / f.filename
     f.save(save_path)
 
-    records = build_index()
+    try:
+        records = build_index()
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
     return jsonify({"status": "indexed", "chunks": len(records)})
 
 
@@ -153,25 +166,28 @@ def chat():
 
     last_user_msg = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
 
-    # Pull in relevant context from uploaded docs, if any exist.
-    context_chunks = retrieve(last_user_msg)
-    sources = sorted({c["source"] for c in context_chunks})
+    try:
+        # Pull in relevant context from uploaded docs, if any exist.
+        context_chunks = retrieve(last_user_msg)
+        sources = sorted({c["source"] for c in context_chunks})
 
-    chat_messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    if context_chunks:
-        context_text = "\n\n---\n\n".join(c["text"] for c in context_chunks)
-        chat_messages.append({
-            "role": "system",
-            "content": f"Relevant context from uploaded documents:\n\n{context_text}",
-        })
-    chat_messages.extend(messages)
+        chat_messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        if context_chunks:
+            context_text = "\n\n---\n\n".join(c["text"] for c in context_chunks)
+            chat_messages.append({
+                "role": "system",
+                "content": f"Relevant context from uploaded documents:\n\n{context_text}",
+            })
+        chat_messages.extend(messages)
 
-    completion = client.chat.completions.create(
-        model=MODEL,
-        messages=chat_messages,
-        temperature=0.7,
-    )
-    reply = completion.choices[0].message.content
+        completion = get_client().chat.completions.create(
+            model=MODEL,
+            messages=chat_messages,
+            temperature=0.7,
+        )
+        reply = completion.choices[0].message.content
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
     return jsonify({"reply": reply, "sources": sources})
 
@@ -184,7 +200,7 @@ def analyze_document():
         return jsonify({"error": "No document text provided"}), 400
 
     try:
-        response = client.chat.completions.create(
+        response = get_client().chat.completions.create(
             model=MODEL,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
